@@ -7,7 +7,7 @@ It does not run or modify 9Router. It only reads token sources and calls Codex d
 ## Install
 
 ```bash
-git clone <private-repo-url>
+git clone https://github.com/dat-lequoc/codex-quota-primer
 cd codex-quota-primer
 npm install
 ```
