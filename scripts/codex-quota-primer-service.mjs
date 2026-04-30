@@ -252,7 +252,10 @@ async function serviceCommand(command) {
     if (command === "start") return run("systemctl", ["--user", "start", serviceName]);
     if (command === "stop") return run("systemctl", ["--user", "stop", serviceName]);
     if (command === "status") return run("systemctl", ["--user", "status", "--no-pager", serviceName]);
-    if (command === "logs") return run("journalctl", ["--user", "-u", serviceName, "-n", "80", "--no-pager"]);
+    if (command === "logs") {
+      console.log(`Log: ${logPath}`);
+      return run("tail", ["-n", "80", logPath]);
+    }
   }
 
   if (process.platform === "darwin") {
