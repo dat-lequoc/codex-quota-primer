@@ -1,0 +1,25 @@
+{
+  "name": "codex-quota-primer",
+  "version": "0.1.0",
+  "description": "Prime idle Codex 5-hour quota windows with a tiny request.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "primer": "node scripts/codex-quota-primer.mjs",
+    "check": "node scripts/codex-quota-primer.mjs --once --dry-run --verbose",
+    "start": "node scripts/codex-quota-primerctl.mjs start",
+    "stop": "node scripts/codex-quota-primerctl.mjs stop",
+    "restart": "node scripts/codex-quota-primerctl.mjs restart",
+    "status": "node scripts/codex-quota-primerctl.mjs status",
+    "logs": "node scripts/codex-quota-primerctl.mjs logs",
+    "service:install": "node scripts/codex-quota-primer-service.mjs install",
+    "service:uninstall": "node scripts/codex-quota-primer-service.mjs uninstall",
+    "service:start": "node scripts/codex-quota-primer-service.mjs start",
+    "service:stop": "node scripts/codex-quota-primer-service.mjs stop",
+    "service:status": "node scripts/codex-quota-primer-service.mjs status",
+    "service:logs": "node scripts/codex-quota-primer-service.mjs logs"
+  }
+}
