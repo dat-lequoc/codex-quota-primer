@@ -9,6 +9,8 @@ const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEFAULT_9ROUTER_BASE_URL = "http://127.0.0.1:20128";
+const DEFAULT_9ROUTER_API_KEY = "sk_9router";
 
 const SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
 const DEFAULT_INTERVAL_MS = 60 * 1000;
@@ -24,7 +26,7 @@ function printHelp() {
 
 Checks Codex OAuth accounts once per minute. When the 5-hour/session quota is
 0% used and the reset timer is still effectively a fresh 5h window, it sends
-a tiny Codex request directly with that account token to start the countdown.
+a tiny Codex request to start the countdown.
 
 Usage:
   node scripts/codex-quota-primer.mjs [options]
@@ -42,6 +44,9 @@ Options:
   --max-used-percent <n>         Max used-percent eligible for activation (default: 0)
   --model <model>                Model used for the tiny activation request (default: ${DEFAULT_MODEL})
   --prompt <text>                Prompt used for activation (default: "${DEFAULT_PROMPT}")
+  --activation-mode <mode>       auto, direct, or 9router (default: auto)
+  --9router-url <url>            9router base URL for activation (default: ${DEFAULT_9ROUTER_BASE_URL})
+  --9router-api-key <key>        9router API key for activation (default: env or ${DEFAULT_9ROUTER_API_KEY})
   --no-refresh                   Do not refresh expired access tokens
   --no-persist-refresh           Do not refresh tokens or write rotated tokens back to source files
   --max-concurrency <n>          Max simultaneous usage checks (default: 4)
@@ -87,6 +92,9 @@ function parseArgs(argv) {
     maxUsedPercent: 0,
     model: DEFAULT_MODEL,
     prompt: DEFAULT_PROMPT,
+    activationMode: process.env.CODEX_QUOTA_PRIMER_ACTIVATION_MODE || "auto",
+    routerUrl: process.env.NINEROUTER_BASE_URL || process.env.CODEX_QUOTA_PRIMER_9ROUTER_URL || DEFAULT_9ROUTER_BASE_URL,
+    routerApiKey: process.env.NINEROUTER_API_KEY || process.env.CODEX_QUOTA_PRIMER_9ROUTER_API_KEY || DEFAULT_9ROUTER_API_KEY,
     refresh: true,
     persistRefresh: true,
     maxConcurrency: 4,
@@ -158,6 +166,17 @@ function parseArgs(argv) {
       case "--prompt":
         options.prompt = next();
         break;
+      case "--activation-mode":
+        options.activationMode = next();
+        break;
+      case "--9router-url":
+      case "--router-url":
+        options.routerUrl = next();
+        break;
+      case "--9router-api-key":
+      case "--router-api-key":
+        options.routerApiKey = next();
+        break;
       case "--no-refresh":
         options.refresh = false;
         break;
@@ -177,6 +196,10 @@ function parseArgs(argv) {
 
   if (options.dryRun) options.persistRefresh = false;
   if (!options.persistRefresh) options.refresh = false;
+  if (!["auto", "direct", "9router"].includes(options.activationMode)) {
+    throw new Error("--activation-mode must be one of: auto, direct, 9router");
+  }
+  options.routerUrl = String(options.routerUrl || DEFAULT_9ROUTER_BASE_URL).replace(/\/+$/, "");
   return options;
 }
 
@@ -589,9 +612,21 @@ function isActivationCandidate(usage, options) {
 }
 
 async function activateCodexToken(token, options) {
-  const sessionId = `quota-primer-${tokenFingerprint(token.accessToken)}`;
-  const body = {
-    model: options.model,
+  if (shouldActivateThrough9Router(token, options)) {
+    return await activateCodexTokenThrough9Router(token, options);
+  }
+  return await activateCodexTokenDirect(token, options);
+}
+
+function shouldActivateThrough9Router(token, options) {
+  if (options.activationMode === "direct") return false;
+  if (options.activationMode === "9router") return true;
+  return token.sourceType === "9router-db";
+}
+
+function buildActivationBody(options, model) {
+  return {
+    model,
     input: [
       {
         type: "message",
@@ -604,6 +639,27 @@ async function activateCodexToken(token, options) {
     stream: true,
     store: false,
   };
+}
+
+function build9RouterModel(model) {
+  return model.includes("/") ? model : `codex/${model}`;
+}
+
+function parseResetHint(status, text) {
+  if (status !== 429 || !text) return null;
+  try {
+    const json = JSON.parse(text);
+    const error = json?.error;
+    return parseTimeMs(error?.resets_at) ||
+      (typeof error?.resets_in_seconds === "number" ? Date.now() + error.resets_in_seconds * 1000 : null);
+  } catch {
+    return null;
+  }
+}
+
+async function activateCodexTokenDirect(token, options) {
+  const sessionId = `quota-primer-${tokenFingerprint(token.accessToken)}`;
+  const body = buildActivationBody(options, options.model);
 
   const response = await fetchWithTimeout(CODEX_RESPONSES_URL, {
     method: "POST",
@@ -622,22 +678,43 @@ async function activateCodexToken(token, options) {
     ? await readResponseText(response, 65536, { drain: true })
     : await response.text().catch(() => "");
 
-  let resetsAtMs = null;
-  if (response.status === 429 && text) {
-    try {
-      const json = JSON.parse(text);
-      const error = json?.error;
-      resetsAtMs = parseTimeMs(error?.resets_at) ||
-        (typeof error?.resets_in_seconds === "number" ? Date.now() + error.resets_in_seconds * 1000 : null);
-    } catch {
-      // Keep raw status only.
-    }
-  }
-
   return {
+    mode: "direct",
     status: response.status,
     ok: response.ok || response.status === 429,
-    resetsAtMs,
+    resetsAtMs: parseResetHint(response.status, text),
+    bodyPreview: text.slice(0, 240),
+  };
+}
+
+async function activateCodexTokenThrough9Router(token, options) {
+  const body = buildActivationBody(options, build9RouterModel(options.model));
+  const headers = {
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+    "User-Agent": "codex-quota-primer/0.1",
+  };
+  if (options.routerApiKey) headers.Authorization = `Bearer ${options.routerApiKey}`;
+  if (token.id) {
+    headers["x-connection-id"] = token.id;
+    headers["x-9router-connection-id"] = token.id;
+  }
+
+  const response = await fetchWithTimeout(`${options.routerUrl}/v1/responses`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  }, options.timeoutMs);
+
+  const text = response.ok
+    ? await readResponseText(response, 65536, { drain: true })
+    : await response.text().catch(() => "");
+
+  return {
+    mode: "9router",
+    status: response.status,
+    ok: response.ok || response.status === 429,
+    resetsAtMs: parseResetHint(response.status, text),
     bodyPreview: text.slice(0, 240),
   };
 }
@@ -767,9 +844,13 @@ async function checkToken(rawToken, options, state) {
 
   try {
     const activation = await activateCodexToken(token, options);
+    if (!activation.ok) {
+      throw new Error(`activation returned ${activation.status}${activation.bodyPreview ? `: ${activation.bodyPreview}` : ""}`);
+    }
     markActivated(token, usage, activation, state);
     const resetHint = activation.resetsAtMs ? ` reset=${formatDuration(activation.resetsAtMs - Date.now())}` : "";
-    log(options, "candidate", `${label} activated: upstream status ${activation.status}${resetHint}`);
+    const modeHint = activation.mode ? ` via ${activation.mode}` : "";
+    log(options, "candidate", `${label} activated${modeHint}: upstream status ${activation.status}${resetHint}`);
     return { checked: 1, candidate: 1, activated: 1, skipped: 0, failed: 0 };
   } catch (error) {
     warn(`${label} activation failed: ${error.message}`);

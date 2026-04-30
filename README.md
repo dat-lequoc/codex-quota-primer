@@ -2,7 +2,7 @@
 
 Codex Quota Primer watches Codex OAuth accounts and sends one tiny request only when an account is idle at `0%` 5-hour usage with a fresh 5-hour reset timer. The goal is to start the countdown for idle Codex quota windows so subscription quota is not left dormant.
 
-It does not run or modify 9Router. It only reads token sources and calls Codex directly when the strict primer condition matches.
+It does not run or modify 9Router. It only reads token sources and, by default, sends the tiny activation request through 9Router for tokens loaded from `~/.9router/db.json`.
 
 ## Install
 
@@ -41,6 +41,12 @@ Run in the foreground:
 
 ```bash
 npm run primer -- --no-refresh
+```
+
+If your 9Router is not on the default local URL, pass it explicitly:
+
+```bash
+npm run start -- --no-refresh --9router-url http://127.0.0.1:20128
 ```
 
 ## Enable 24/7
@@ -89,6 +95,34 @@ npm run check -- --no-codex-auth
 npm run check -- --no-db
 ```
 
+## Activation Route
+
+Default mode is `auto`:
+
+```text
+~/.9router/db.json tokens -> activate through 9Router
+~/.codex/auth.json tokens -> activate directly with Codex
+```
+
+9Router activation uses:
+
+```text
+POST http://127.0.0.1:20128/v1/responses
+Authorization: Bearer sk_9router
+x-connection-id: <9router connection id>
+```
+
+Override the route:
+
+```bash
+npm run start -- --activation-mode 9router --9router-url http://127.0.0.1:20128 --9router-api-key sk_9router
+npm run start -- --activation-mode direct
+```
+
+Using 9Router matters when a 9Router connection has custom outbound proxy settings. The primer then asks 9Router to make the activation request, so the request can use the same provider routing/proxy path as normal 9Router traffic.
+
+Exact per-token activation through 9Router requires a 9Router build that honors `x-connection-id` on `/v1/responses`. If the running 9Router ignores that header, the request still goes through 9Router but uses 9Router's normal account selection.
+
 ## How It Works
 
 Every 60 seconds, the primer:
@@ -98,7 +132,8 @@ Every 60 seconds, the primer:
 3. Checks `rate_limit.primary_window.used_percent`.
 4. Checks `rate_limit.primary_window.reset_at`.
 5. Activates only when usage is `0%` and reset time is effectively a fresh 5-hour window.
-6. Sends `hello how are you` to the Codex responses endpoint with `reasoning.effort = none`.
+6. Sends `hello how are you` with `reasoning.effort = none`.
+7. Uses 9Router for activation when the token came from the 9Router DB, otherwise calls Codex directly.
 
 The default fresh-window check is about `4h 58m 55s` to `5h 02m 00s` remaining. Tokens with non-zero 5-hour usage, or tokens resetting soon, are not activated.
 
