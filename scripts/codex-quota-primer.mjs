@@ -10,7 +10,7 @@ const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_9ROUTER_BASE_URL = "http://127.0.0.1:20128";
-const DEFAULT_9ROUTER_API_KEY = "sk_9router";
+const DEFAULT_9ROUTER_API_KEY = "auto";
 
 const SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
 const DEFAULT_INTERVAL_MS = 60 * 1000;
@@ -46,7 +46,7 @@ Options:
   --prompt <text>                Prompt used for activation (default: "${DEFAULT_PROMPT}")
   --activation-mode <mode>       auto, direct, or 9router (default: auto)
   --9router-url <url>            9router base URL for activation (default: ${DEFAULT_9ROUTER_BASE_URL})
-  --9router-api-key <key>        9router API key for activation (default: env or ${DEFAULT_9ROUTER_API_KEY})
+  --9router-api-key <key>        9router API key, or auto to read active db key (default: env or auto)
   --no-refresh                   Do not refresh expired access tokens
   --no-persist-refresh           Do not refresh tokens or write rotated tokens back to source files
   --max-concurrency <n>          Max simultaneous usage checks (default: 4)
@@ -95,6 +95,7 @@ function parseArgs(argv) {
     activationMode: process.env.CODEX_QUOTA_PRIMER_ACTIVATION_MODE || "auto",
     routerUrl: process.env.NINEROUTER_BASE_URL || process.env.CODEX_QUOTA_PRIMER_9ROUTER_URL || DEFAULT_9ROUTER_BASE_URL,
     routerApiKey: process.env.NINEROUTER_API_KEY || process.env.CODEX_QUOTA_PRIMER_9ROUTER_API_KEY || DEFAULT_9ROUTER_API_KEY,
+    resolvedRouterApiKey: undefined,
     refresh: true,
     persistRefresh: true,
     maxConcurrency: 4,
@@ -689,15 +690,17 @@ async function activateCodexTokenDirect(token, options) {
 
 async function activateCodexTokenThrough9Router(token, options) {
   const body = buildActivationBody(options, build9RouterModel(options.model));
+  const routerApiKey = await resolve9RouterApiKey(options);
   const headers = {
     Accept: "text/event-stream",
     "Content-Type": "application/json",
     "User-Agent": "codex-quota-primer/0.1",
   };
-  if (options.routerApiKey) headers.Authorization = `Bearer ${options.routerApiKey}`;
+  if (routerApiKey) headers.Authorization = `Bearer ${routerApiKey}`;
   if (token.id) {
     headers["x-connection-id"] = token.id;
     headers["x-9router-connection-id"] = token.id;
+    headers["x-9router-force-connection"] = "true";
   }
 
   const response = await fetchWithTimeout(`${options.routerUrl}/v1/responses`, {
@@ -717,6 +720,25 @@ async function activateCodexTokenThrough9Router(token, options) {
     resetsAtMs: parseResetHint(response.status, text),
     bodyPreview: text.slice(0, 240),
   };
+}
+
+async function resolve9RouterApiKey(options) {
+  if (options.resolvedRouterApiKey !== undefined) return options.resolvedRouterApiKey;
+  const configured = String(options.routerApiKey || "").trim();
+  if (configured && configured !== "auto") {
+    options.resolvedRouterApiKey = configured;
+    return options.resolvedRouterApiKey;
+  }
+
+  try {
+    const db = await readJsonFile(options.dbPath);
+    const key = (Array.isArray(db?.apiKeys) ? db.apiKeys : [])
+      .find((item) => item?.isActive !== false && typeof item.key === "string" && item.key.trim())?.key;
+    options.resolvedRouterApiKey = key || "";
+  } catch {
+    options.resolvedRouterApiKey = "";
+  }
+  return options.resolvedRouterApiKey;
 }
 
 async function loadState(options) {

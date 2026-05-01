@@ -108,16 +108,19 @@ Default mode is `auto`:
 
 ```text
 POST http://127.0.0.1:20128/v1/responses
-Authorization: Bearer sk_9router
+Authorization: Bearer <active 9Router API key>
 x-connection-id: <9router connection id>
+x-9router-force-connection: true
 ```
 
 Override the route:
 
 ```bash
-npm run start -- --activation-mode 9router --9router-url http://127.0.0.1:20128 --9router-api-key sk_9router
+npm run start -- --activation-mode 9router --9router-url http://127.0.0.1:20128 --9router-api-key auto
 npm run start -- --activation-mode direct
 ```
+
+With `--9router-api-key auto`, the primer reads the first active 9Router API key from the configured 9Router DB and never logs it.
 
 Using 9Router matters when a 9Router connection has custom outbound proxy settings. The primer then asks 9Router to make the activation request, so the request can use the same provider routing/proxy path as normal 9Router traffic.
 
