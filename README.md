@@ -131,12 +131,14 @@ Exact per-token activation through 9Router requires a 9Router build that honors 
 Every 60 seconds, the primer:
 
 1. Reads Codex OAuth tokens from the configured sources.
-2. Calls `https://chatgpt.com/backend-api/wham/usage`.
-3. Checks `rate_limit.primary_window.used_percent`.
-4. Checks `rate_limit.primary_window.reset_at`.
-5. Activates only when usage is `0%` and reset time is effectively a fresh 5-hour window.
-6. Sends `hello how are you` with `reasoning.effort = none`.
-7. Uses 9Router for activation when the token came from the 9Router DB, otherwise calls Codex directly.
+2. Re-checks the configured 9Router DB before token refresh, usage checks, or activation.
+3. Skips any token that currently matches a disabled 9Router Codex connection.
+4. Calls `https://chatgpt.com/backend-api/wham/usage`.
+5. Checks `rate_limit.primary_window.used_percent`.
+6. Checks `rate_limit.primary_window.reset_at`.
+7. Activates only when usage is `0%` and reset time is effectively a fresh 5-hour window.
+8. Sends `hello how are you` with `reasoning.effort = none`.
+9. Uses 9Router for activation when the token came from the 9Router DB, otherwise calls Codex directly.
 
 The default fresh-window check is about `4h 58m 55s` to `5h 02m 00s` remaining. Tokens with non-zero 5-hour usage, or tokens resetting soon, are not activated.
 

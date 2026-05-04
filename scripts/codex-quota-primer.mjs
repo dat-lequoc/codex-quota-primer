@@ -38,7 +38,7 @@ Options:
   --codex-auth-path <path>       Codex auth.json path (default: ~/.codex/auth.json)
   --no-db                        Do not read 9router db.json
   --no-codex-auth                Do not read ~/.codex/auth.json
-  --include-inactive             Include inactive 9router Codex connections
+  --include-inactive             Include inactive 9router Codex connections in local scans only
   --interval-ms <ms>             Poll interval (default: 60000)
   --start-threshold-ms <ms>      Treat reset as fresh 5h if remaining >= 5h - this value (default: 65000)
   --max-used-percent <n>         Max used-percent eligible for activation (default: 0)
@@ -391,10 +391,12 @@ function collectAuthJsonTokens(root, authPath) {
 
     if (looksLikeOAuthAccessToken(accessToken) && !seen.has(accessToken)) {
       seen.add(accessToken);
+      const email = node.email || node.account_email || null;
       const id = `codex-auth:${objectPath.join(".") || "root"}:${tokenFingerprint(accessToken)}`;
       found.push({
         id,
-        label: node.email || node.account_email || node.account_id || id,
+        label: email || node.account_id || id,
+        email,
         sourceType: "codex-auth",
         sourcePath: authPath,
         accessToken,
@@ -413,18 +415,102 @@ function collectAuthJsonTokens(root, authPath) {
   return found;
 }
 
+function isDisabled9RouterCodexConnection(connection) {
+  if (!connection || typeof connection !== "object") return false;
+  if (connection.isActive === false) return true;
+  if (connection.enabled === false) return true;
+  if (connection.disabled === true) return true;
+
+  const status = typeof connection.status === "string" ? connection.status.toLowerCase() : "";
+  return status === "disabled" || status === "inactive";
+}
+
+function get9RouterCodexConnections(db) {
+  const connections = Array.isArray(db?.providerConnections) ? db.providerConnections : [];
+  return connections.filter((connection) => connection?.provider === "codex");
+}
+
+function normalizeEmail(value) {
+  if (typeof value !== "string" || !value.includes("@")) return "";
+  return value.trim().toLowerCase();
+}
+
+function connectionEmail(connection) {
+  return normalizeEmail(
+    connection?.email ||
+    connection?.account_email ||
+    connection?.accountEmail ||
+    connection?.displayName ||
+    connection?.name ||
+    "",
+  );
+}
+
+function tokenEmail(token) {
+  return normalizeEmail(token.email || token.label || "");
+}
+
+function findMatching9RouterCodexConnections(token, connections) {
+  const connectionId = token.updateRef?.kind === "9router-db" ? token.updateRef.connectionId : null;
+  if (connectionId) {
+    return connections.filter((connection) => connection.id === connectionId);
+  }
+
+  const exactMatches = connections.filter((connection) =>
+    (token.accessToken && connection.accessToken === token.accessToken) ||
+    (token.refreshToken && connection.refreshToken === token.refreshToken)
+  );
+  if (exactMatches.length > 0) return exactMatches;
+
+  const email = tokenEmail(token);
+  if (!email) return [];
+  return connections.filter((connection) => connectionEmail(connection) === email);
+}
+
+async function getCurrentDbAccess(token, options) {
+  if (!options.useDb) return { allowed: true };
+
+  let db;
+  try {
+    db = await readJsonFile(options.dbPath);
+  } catch (error) {
+    return { allowed: false, reason: `9Router DB check failed: ${error.message}` };
+  }
+
+  if (!db) {
+    if (token.sourceType === "9router-db") {
+      return { allowed: false, reason: "missing from 9Router DB" };
+    }
+    return { allowed: true };
+  }
+
+  const connections = get9RouterCodexConnections(db);
+  const matches = findMatching9RouterCodexConnections(token, connections);
+  if (matches.length === 0) {
+    if (token.sourceType === "9router-db") {
+      return { allowed: false, reason: "missing from 9Router DB" };
+    }
+    return { allowed: true };
+  }
+
+  if (matches.some((connection) => !isDisabled9RouterCodexConnection(connection))) {
+    return { allowed: true };
+  }
+
+  return { allowed: false, reason: "disabled in 9Router DB" };
+}
+
 async function load9RouterDbTokens(options) {
   const db = await readJsonFile(options.dbPath);
   if (!db) return [];
 
-  const connections = Array.isArray(db.providerConnections) ? db.providerConnections : [];
-  return connections
-    .filter((connection) => connection?.provider === "codex")
-    .filter((connection) => options.includeInactive || connection.isActive !== false)
+  return get9RouterCodexConnections(db)
+    .filter((connection) => options.includeInactive || !isDisabled9RouterCodexConnection(connection))
     .filter((connection) => looksLikeOAuthAccessToken(connection.accessToken))
     .map((connection) => ({
       id: connection.id,
       label: connection.displayName || connection.name || connection.email || connection.id,
+      email: connection.email || connection.account_email || connection.accountEmail || null,
       sourceType: "9router-db",
       sourcePath: options.dbPath,
       accessToken: connection.accessToken,
@@ -803,6 +889,12 @@ async function checkToken(rawToken, options, state) {
   const label = redactId(rawToken.label || rawToken.id);
   let token = rawToken;
 
+  let dbAccess = await getCurrentDbAccess(token, options);
+  if (!dbAccess.allowed) {
+    log(options, "info", `${label} skipped: ${dbAccess.reason}; no token refresh, usage check, or activation request sent`);
+    return { checked: 1, candidate: 0, activated: 0, skipped: 1, failed: 0 };
+  }
+
   try {
     token = await ensureFreshToken(token, options);
   } catch (error) {
@@ -861,6 +953,12 @@ async function checkToken(rawToken, options, state) {
 
   if (recentlyActivated(token, usage, state, options)) {
     log(options, "candidate", `${label} skipped: activated recently for this reset window`);
+    return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
+  }
+
+  dbAccess = await getCurrentDbAccess(token, options);
+  if (!dbAccess.allowed) {
+    log(options, "candidate", `${label} skipped before activation: ${dbAccess.reason}`);
     return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
   }
 
