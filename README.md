@@ -1,8 +1,8 @@
 # Codex Quota Primer
 
-Codex Quota Primer watches Codex OAuth accounts and sends one tiny request only when an account is idle at `0%` 5-hour usage with a fresh 5-hour reset timer. The goal is to start the countdown for idle Codex quota windows so subscription quota is not left dormant.
+Codex Quota Primer watches Codex OAuth accounts and sends one tiny request only when an account still has a fresh 5-hour reset timer and weekly quota remains. The goal is to start the countdown for idle Codex quota windows so subscription quota is not left dormant.
 
-It does not run or modify 9Router. It only reads token sources and, by default, sends the tiny activation request through 9Router for tokens loaded from `~/.9router/db.json`.
+It does not run or modify 9Router. It reads token sources and 9Router proxy-pool settings; by default, tokens loaded from `~/.9router/db/data.sqlite` are activated directly against Codex through the account's configured 9Router proxy pool when one is bound. Legacy `~/.9router/db.json` is used only as a fallback.
 
 ## Install
 
@@ -13,6 +13,34 @@ npm install
 ```
 
 Requires Node.js 18 or newer.
+
+## One-command Deploy
+
+Install dependencies, install the native user service, start it, and print status:
+
+```bash
+npm run deploy
+```
+
+Or run the Bash script directly:
+
+```bash
+./scripts/deploy.sh
+```
+
+This uses `--no-refresh` by default for read-only token handling. Pass primer options directly:
+
+```bash
+npm run deploy -- --9router-url http://127.0.0.1:20128
+./scripts/deploy.sh --9router-url http://127.0.0.1:20128
+```
+
+Allow token refresh during daemon runs:
+
+```bash
+npm run deploy -- --allow-refresh
+./scripts/deploy.sh --allow-refresh
+```
 
 ## Run
 
@@ -78,15 +106,17 @@ npm run service:uninstall
 By default it reads Codex OAuth tokens from:
 
 ```text
-~/.9router/db.json
+~/.9router/db/data.sqlite
 ~/.codex/auth.json
 ```
 
 Point it at another DB:
 
 ```bash
-npm run start -- --db-path /path/to/db.json --no-refresh
+npm run start -- --db-path /path/to/data.sqlite --no-refresh
 ```
+
+If the SQLite DB is missing, the default path falls back to legacy `~/.9router/db.json` or `~/.9router/db.json.migrated`.
 
 Use only one source:
 
@@ -100,11 +130,19 @@ npm run check -- --no-db
 Default mode is `auto`:
 
 ```text
-~/.9router/db.json tokens -> activate through 9Router
+~/.9router/db/data.sqlite tokens -> activate directly with Codex through the bound 9Router proxy pool, if any
 ~/.codex/auth.json tokens -> activate directly with Codex
 ```
 
-9Router activation uses:
+For 9Router relay proxy pools, activation uses the pool relay URL with:
+
+```text
+x-relay-target: https://chatgpt.com
+x-relay-path: /backend-api/codex/responses
+Authorization: Bearer <Codex account access token>
+```
+
+The legacy `9router` activation mode uses:
 
 ```text
 POST http://127.0.0.1:20128/v1/responses
@@ -116,13 +154,14 @@ x-9router-force-connection: true
 Override the route:
 
 ```bash
+npm run start -- --activation-mode direct-proxy
 npm run start -- --activation-mode 9router --9router-url http://127.0.0.1:20128 --9router-api-key auto
 npm run start -- --activation-mode direct
 ```
 
 With `--9router-api-key auto`, the primer reads the first active 9Router API key from the configured 9Router DB and never logs it.
 
-Using 9Router matters when a 9Router connection has custom outbound proxy settings. The primer then asks 9Router to make the activation request, so the request can use the same provider routing/proxy path as normal 9Router traffic.
+Using 9Router DB proxy settings matters when a 9Router connection has custom outbound proxy settings. In `auto` or `direct-proxy` mode, the primer resolves the account's bound proxy pool from the DB and sends the activation request through that same outbound proxy or relay.
 
 Exact per-token activation through 9Router requires a 9Router build that honors `x-connection-id` on `/v1/responses`. If the running 9Router ignores that header, the request still goes through 9Router but uses 9Router's normal account selection.
 
@@ -132,15 +171,16 @@ Every 60 seconds, the primer:
 
 1. Reads Codex OAuth tokens from the configured sources.
 2. Re-checks the configured 9Router DB before token refresh, usage checks, or activation.
-3. Skips any token that currently matches a disabled 9Router Codex connection.
+3. Skips normal token refresh and normal 5-hour activation for disabled 9Router Codex connections.
 4. Calls `https://chatgpt.com/backend-api/wham/usage`.
 5. Checks `rate_limit.primary_window.used_percent`.
 6. Checks `rate_limit.primary_window.reset_at`.
-7. Activates only when usage is `0%` and reset time is effectively a fresh 5-hour window.
-8. Sends `hello how are you` with `reasoning.effort = none`.
-9. Uses 9Router for activation when the token came from the 9Router DB, otherwise calls Codex directly.
+7. Activates enabled accounts only when the 5-hour reset time is effectively fresh, default `>= 4h 58m`, and weekly quota remains.
+8. Treats weekly quota as remaining when weekly usage is below `100%`, or when the weekly reset time is effectively fresh, default `>= 6d 23h 58m`.
+9. Sends `hello how are you` with `reasoning.effort = none`.
+10. Uses direct-proxy activation for 9Router DB tokens, otherwise calls Codex directly.
 
-The default fresh-window check is about `4h 58m 55s` to `5h 02m 00s` remaining. Tokens with non-zero 5-hour usage, or tokens resetting soon, are not activated.
+The default 5-hour fresh-window check is about `4h 58m 0s` to `5h 02m 0s` remaining. The weekly fresh-window check uses the same threshold around a full 7 days remaining. Tokens with exhausted weekly quota outside a fresh weekly reset, or tokens resetting soon, are not activated.
 
 ## Files
 

@@ -2,8 +2,11 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+
+const requireFromHere = createRequire(import.meta.url);
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -13,11 +16,13 @@ const DEFAULT_9ROUTER_BASE_URL = "http://127.0.0.1:20128";
 const DEFAULT_9ROUTER_API_KEY = "auto";
 
 const SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
+const WEEK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_INTERVAL_MS = 60 * 1000;
-const DEFAULT_START_THRESHOLD_MS = 65 * 1000;
+const DEFAULT_START_THRESHOLD_MS = 2 * 60 * 1000;
 const DEFAULT_CLOCK_SKEW_MS = 2 * 60 * 1000;
 const DEFAULT_ACTIVATION_COOLDOWN_MS = 15 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 15 * 1000;
+const DEFAULT_MAX_USED_PERCENT = 100;
 const DEFAULT_MODEL = "gpt-5.3-codex";
 const DEFAULT_PROMPT = "hello how are you";
 
@@ -25,8 +30,8 @@ function printHelp() {
   console.log(`Codex quota primer
 
 Checks Codex OAuth accounts once per minute. When the 5-hour/session quota is
-0% used and the reset timer is still effectively a fresh 5h window, it sends
-a tiny Codex request to start the countdown.
+still effectively a fresh 5h window and weekly quota remains, it sends a tiny
+Codex request to start the countdown.
 
 Usage:
   node scripts/codex-quota-primer.mjs [options]
@@ -34,17 +39,17 @@ Usage:
 Options:
   --once                         Run one check and exit
   --dry-run                      Query usage and print candidates, but do not activate or persist refreshes
-  --db-path <path>               9router db.json path (default: DATA_DIR/db.json or platform default)
+  --db-path <path>               9router DB path (default: DATA_DIR/db/data.sqlite, legacy DATA_DIR/db.json fallback)
   --codex-auth-path <path>       Codex auth.json path (default: ~/.codex/auth.json)
-  --no-db                        Do not read 9router db.json
+  --no-db                        Do not read 9router DB
   --no-codex-auth                Do not read ~/.codex/auth.json
-  --include-inactive             Include inactive 9router Codex connections in local scans only
+  --include-inactive             Deprecated; disabled 9router Codex connections are weekly-reset checked
   --interval-ms <ms>             Poll interval (default: 60000)
-  --start-threshold-ms <ms>      Treat reset as fresh 5h if remaining >= 5h - this value (default: 65000)
-  --max-used-percent <n>         Max used-percent eligible for activation (default: 0)
+  --start-threshold-ms <ms>      Treat reset as fresh 5h if remaining >= 5h - this value (default: ${DEFAULT_START_THRESHOLD_MS})
+  --max-used-percent <n>         Max 5-hour used-percent eligible for activation (default: ${DEFAULT_MAX_USED_PERCENT})
   --model <model>                Model used for the tiny activation request (default: ${DEFAULT_MODEL})
   --prompt <text>                Prompt used for activation (default: "${DEFAULT_PROMPT}")
-  --activation-mode <mode>       auto, direct, or 9router (default: auto)
+  --activation-mode <mode>       auto, direct-proxy, direct, or 9router (default: auto)
   --9router-url <url>            9router base URL for activation (default: ${DEFAULT_9ROUTER_BASE_URL})
   --9router-api-key <key>        9router API key, or auto to read active db key (default: env or auto)
   --no-refresh                   Do not refresh expired access tokens
@@ -78,7 +83,7 @@ function parseArgs(argv) {
   const options = {
     once: false,
     dryRun: false,
-    dbPath: process.env.NINEROUTER_DB_PATH || path.join(dataDir, "db.json"),
+    dbPath: process.env.NINEROUTER_DB_PATH || path.join(dataDir, "db", "data.sqlite"),
     codexAuthPath: process.env.CODEX_AUTH_PATH || path.join(os.homedir(), ".codex", "auth.json"),
     statePath: process.env.CODEX_QUOTA_PRIMER_STATE_PATH || path.join(dataDir, "codex-quota-primer-state.json"),
     useDb: true,
@@ -89,7 +94,7 @@ function parseArgs(argv) {
     clockSkewMs: DEFAULT_CLOCK_SKEW_MS,
     activationCooldownMs: DEFAULT_ACTIVATION_COOLDOWN_MS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
-    maxUsedPercent: 0,
+    maxUsedPercent: DEFAULT_MAX_USED_PERCENT,
     model: DEFAULT_MODEL,
     prompt: DEFAULT_PROMPT,
     activationMode: process.env.CODEX_QUOTA_PRIMER_ACTIVATION_MODE || "auto",
@@ -197,8 +202,8 @@ function parseArgs(argv) {
 
   if (options.dryRun) options.persistRefresh = false;
   if (!options.persistRefresh) options.refresh = false;
-  if (!["auto", "direct", "9router"].includes(options.activationMode)) {
-    throw new Error("--activation-mode must be one of: auto, direct, 9router");
+  if (!["auto", "direct-proxy", "direct", "9router"].includes(options.activationMode)) {
+    throw new Error("--activation-mode must be one of: auto, direct-proxy, direct, 9router");
   }
   options.routerUrl = String(options.routerUrl || DEFAULT_9ROUTER_BASE_URL).replace(/\/+$/, "");
   return options;
@@ -241,6 +246,156 @@ async function readJsonFile(filePath) {
     if (error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function isSqliteDbPath(filePath) {
+  const lower = String(filePath || "").toLowerCase();
+  return lower.endsWith(".sqlite") || lower.endsWith(".sqlite3") || lower.endsWith(".db");
+}
+
+function sqliteDataDir(sqlitePath) {
+  if (path.basename(sqlitePath) === "data.sqlite" && path.basename(path.dirname(sqlitePath)) === "db") {
+    return path.dirname(path.dirname(sqlitePath));
+  }
+  return getDefaultDataDir();
+}
+
+function getDbPathCandidates(dbPath) {
+  const primary = path.resolve(dbPath);
+  const candidates = [primary];
+
+  if (path.basename(primary) === "data.sqlite" && path.basename(path.dirname(primary)) === "db") {
+    const dataDir = path.dirname(path.dirname(primary));
+    candidates.push(path.join(dataDir, "db.json"));
+    candidates.push(path.join(dataDir, "db.json.migrated"));
+  }
+
+  return [...new Set(candidates)];
+}
+
+let betterSqlite3Module = null;
+async function loadBetterSqlite3(sqlitePath) {
+  if (betterSqlite3Module) return betterSqlite3Module;
+
+  try {
+    const mod = await import("better-sqlite3");
+    betterSqlite3Module = mod.default || mod;
+    return betterSqlite3Module;
+  } catch {
+    // Fall through to 9Router's packaged runtime dependency.
+  }
+
+  const dataDir = sqliteDataDir(sqlitePath);
+  const candidates = [
+    process.env.NINEROUTER_NODE_MODULES ? path.join(process.env.NINEROUTER_NODE_MODULES, "better-sqlite3") : null,
+    path.join(dataDir, "runtime", "node_modules", "better-sqlite3"),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      betterSqlite3Module = requireFromHere(candidate);
+      return betterSqlite3Module;
+    } catch {
+      // Try the next known location.
+    }
+  }
+
+  throw new Error(`SQLite 9Router DB requires better-sqlite3; install it here or keep 9Router runtime at ${path.join(dataDir, "runtime")}`);
+}
+
+function parseJsonColumn(value, fallback = {}) {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function rowActive(value) {
+  return !(value === 0 || value === false);
+}
+
+function sqliteConnectionRowToObject(row) {
+  const extra = parseJsonColumn(row.data, {});
+  return {
+    ...extra,
+    id: row.id,
+    provider: row.provider,
+    authType: row.authType,
+    name: row.name,
+    email: row.email,
+    priority: row.priority,
+    isActive: rowActive(row.isActive),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function sqliteProxyPoolRowToObject(row) {
+  const extra = parseJsonColumn(row.data, {});
+  return {
+    ...extra,
+    id: row.id,
+    isActive: rowActive(row.isActive),
+    testStatus: row.testStatus,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function read9RouterSqliteDb(filePath) {
+  const Database = await loadBetterSqlite3(filePath);
+  const db = new Database(filePath, { readonly: true, fileMustExist: true });
+  try {
+    return {
+      __sourceFormat: "sqlite",
+      __sourcePath: filePath,
+      providerConnections: db.prepare("SELECT * FROM providerConnections").all().map(sqliteConnectionRowToObject),
+      proxyPools: db.prepare("SELECT * FROM proxyPools").all().map(sqliteProxyPoolRowToObject),
+      apiKeys: db.prepare("SELECT * FROM apiKeys").all().map((row) => ({
+        id: row.id,
+        key: row.key,
+        name: row.name,
+        machineId: row.machineId,
+        isActive: rowActive(row.isActive),
+        createdAt: row.createdAt,
+      })),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+async function read9RouterDb(options) {
+  for (const candidate of getDbPathCandidates(options.dbPath)) {
+    if (!(await pathExists(candidate))) continue;
+
+    if (isSqliteDbPath(candidate)) {
+      return await read9RouterSqliteDb(candidate);
+    }
+
+    const db = await readJsonFile(candidate);
+    if (db) {
+      return {
+        ...db,
+        __sourceFormat: "json",
+        __sourcePath: candidate,
+      };
+    }
+  }
+
+  return null;
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -320,6 +475,90 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function normalizeString(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
+}
+
+function redactUrlSecrets(value) {
+  if (!value) return "";
+  return String(value)
+    .replace(/([?&](?:key|token|api_key|apikey)=)[^&\s]+/gi, "$1<redacted>")
+    .replace(/(https?:\/\/)([^:@/\s]+):([^@/\s]+)@/gi, "$1$2:<redacted>@");
+}
+
+function proxyLabel(proxyConfig) {
+  if (!proxyConfig || proxyConfig.source === "none") return "direct";
+  const name = proxyConfig.proxyPoolName || proxyConfig.source;
+  return `${proxyConfig.source}${name && name !== proxyConfig.source ? `:${name}` : ""}`;
+}
+
+function shouldBypassByNoProxy(targetUrl, noProxyValue) {
+  const noProxy = normalizeString(noProxyValue);
+  if (!noProxy) return false;
+
+  let hostname;
+  try {
+    hostname = new URL(targetUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+
+  return noProxy
+    .split(",")
+    .map((pattern) => pattern.trim().toLowerCase())
+    .filter(Boolean)
+    .some((pattern) => {
+      if (pattern === "*") return true;
+      if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
+      return hostname === pattern || hostname.endsWith(`.${pattern}`);
+    });
+}
+
+let undiciModulePromise = null;
+async function getUndiciModule() {
+  if (!undiciModulePromise) undiciModulePromise = import("undici");
+  return await undiciModulePromise;
+}
+
+const proxyDispatchers = new Map();
+async function getProxyDispatcher(proxyUrl) {
+  if (!proxyDispatchers.has(proxyUrl)) {
+    const { ProxyAgent } = await getUndiciModule();
+    proxyDispatchers.set(proxyUrl, new ProxyAgent({ uri: proxyUrl }));
+  }
+  return proxyDispatchers.get(proxyUrl);
+}
+
+async function fetchWithOptionalProxy(url, init, timeoutMs, proxyConfig) {
+  const targetUrl = typeof url === "string" ? url : url.toString();
+  const config = proxyConfig && proxyConfig.source !== "none" ? proxyConfig : null;
+  const noProxy = config?.connectionNoProxy || config?.noProxy || "";
+
+  if (!config || shouldBypassByNoProxy(targetUrl, noProxy)) {
+    return await fetchWithTimeout(url, init, timeoutMs);
+  }
+
+  if (config.source === "relay") {
+    const parsed = new URL(targetUrl);
+    return await fetchWithTimeout(config.relayUrl, {
+      ...init,
+      headers: {
+        ...(init.headers || {}),
+        "x-relay-target": `${parsed.protocol}//${parsed.host}`,
+        "x-relay-path": `${parsed.pathname}${parsed.search}`,
+      },
+    }, timeoutMs);
+  }
+
+  if (config.source === "proxy") {
+    const dispatcher = await getProxyDispatcher(config.connectionProxyUrl);
+    return await fetchWithTimeout(url, { ...init, dispatcher }, timeoutMs);
+  }
+
+  return await fetchWithTimeout(url, init, timeoutMs);
 }
 
 async function readResponseText(response, maxBytes = 8192, { drain = false } = {}) {
@@ -450,6 +689,59 @@ function tokenEmail(token) {
   return normalizeEmail(token.email || token.label || "");
 }
 
+function dbAccessResult(allowed, reason = "", { disabled = false } = {}) {
+  return { allowed, reason, disabled };
+}
+
+function resolveActivationProxyConfig(connection, db) {
+  const data = connection?.providerSpecificData || {};
+  const proxyPoolId = normalizeString(data.proxyPoolId);
+  const pools = Array.isArray(db?.proxyPools) ? db.proxyPools : [];
+  const pool = proxyPoolId && proxyPoolId !== "__none__"
+    ? pools.find((item) => item?.id === proxyPoolId)
+    : null;
+  const poolProxyUrl = normalizeString(pool?.proxyUrl);
+
+  if (pool && pool.isActive === true && poolProxyUrl) {
+    if (pool.type === "vercel") {
+      return {
+        source: "relay",
+        proxyPoolId,
+        proxyPoolName: pool.name || proxyPoolId,
+        relayUrl: poolProxyUrl,
+        connectionNoProxy: normalizeString(pool.noProxy),
+        strictProxy: pool.strictProxy === true,
+      };
+    }
+
+    return {
+      source: "proxy",
+      proxyPoolId,
+      proxyPoolName: pool.name || proxyPoolId,
+      connectionProxyUrl: poolProxyUrl,
+      connectionNoProxy: normalizeString(pool.noProxy),
+      strictProxy: pool.strictProxy === true,
+    };
+  }
+
+  if (data.connectionProxyEnabled === true && normalizeString(data.connectionProxyUrl)) {
+    return {
+      source: "proxy",
+      proxyPoolId: proxyPoolId || null,
+      proxyPoolName: "legacy",
+      connectionProxyUrl: normalizeString(data.connectionProxyUrl),
+      connectionNoProxy: normalizeString(data.connectionNoProxy),
+      strictProxy: false,
+    };
+  }
+
+  return {
+    source: "none",
+    proxyPoolId: proxyPoolId || null,
+    proxyPoolName: null,
+  };
+}
+
 function findMatching9RouterCodexConnections(token, connections) {
   const connectionId = token.updateRef?.kind === "9router-db" ? token.updateRef.connectionId : null;
   if (connectionId) {
@@ -468,55 +760,56 @@ function findMatching9RouterCodexConnections(token, connections) {
 }
 
 async function getCurrentDbAccess(token, options) {
-  if (!options.useDb) return { allowed: true };
+  if (!options.useDb) return dbAccessResult(true);
 
   let db;
   try {
-    db = await readJsonFile(options.dbPath);
+    db = await read9RouterDb(options);
   } catch (error) {
-    return { allowed: false, reason: `9Router DB check failed: ${error.message}` };
+    return dbAccessResult(false, `9Router DB check failed: ${error.message}`);
   }
 
   if (!db) {
     if (token.sourceType === "9router-db") {
-      return { allowed: false, reason: "missing from 9Router DB" };
+      return dbAccessResult(false, "missing from 9Router DB");
     }
-    return { allowed: true };
+    return dbAccessResult(true);
   }
 
   const connections = get9RouterCodexConnections(db);
   const matches = findMatching9RouterCodexConnections(token, connections);
   if (matches.length === 0) {
     if (token.sourceType === "9router-db") {
-      return { allowed: false, reason: "missing from 9Router DB" };
+      return dbAccessResult(false, "missing from 9Router DB");
     }
-    return { allowed: true };
+    return dbAccessResult(true);
   }
 
   if (matches.some((connection) => !isDisabled9RouterCodexConnection(connection))) {
-    return { allowed: true };
+    return dbAccessResult(true);
   }
 
-  return { allowed: false, reason: "disabled in 9Router DB" };
+  return dbAccessResult(false, "disabled in 9Router DB", { disabled: true });
 }
 
 async function load9RouterDbTokens(options) {
-  const db = await readJsonFile(options.dbPath);
+  const db = await read9RouterDb(options);
   if (!db) return [];
 
   return get9RouterCodexConnections(db)
-    .filter((connection) => options.includeInactive || !isDisabled9RouterCodexConnection(connection))
     .filter((connection) => looksLikeOAuthAccessToken(connection.accessToken))
     .map((connection) => ({
       id: connection.id,
       label: connection.displayName || connection.name || connection.email || connection.id,
       email: connection.email || connection.account_email || connection.accountEmail || null,
       sourceType: "9router-db",
-      sourcePath: options.dbPath,
+      sourcePath: db.__sourcePath || options.dbPath,
+      sourceFormat: db.__sourceFormat || "json",
       accessToken: connection.accessToken,
       refreshToken: connection.refreshToken,
       expiresAt: connection.expiresAt || connection.tokenExpiresAt,
-      updateRef: { kind: "9router-db", connectionId: connection.id },
+      activationProxy: resolveActivationProxyConfig(connection, db),
+      updateRef: { kind: "9router-db", connectionId: connection.id, dbFormat: db.__sourceFormat || "json" },
     }));
 }
 
@@ -582,10 +875,34 @@ async function refreshCodexAccessToken(token, options) {
   };
 }
 
+async function persistRefreshed9RouterSqliteToken(token, refreshed) {
+  const Database = await loadBetterSqlite3(token.sourcePath);
+  const db = new Database(token.sourcePath, { fileMustExist: true });
+  try {
+    const row = db.prepare("SELECT data FROM providerConnections WHERE id = ?").get(token.updateRef.connectionId);
+    if (!row) throw new Error(`connection disappeared: ${token.updateRef.connectionId}`);
+
+    const data = parseJsonColumn(row.data, {});
+    data.accessToken = refreshed.accessToken;
+    data.refreshToken = refreshed.refreshToken;
+    if (refreshed.expiresAt) data.expiresAt = refreshed.expiresAt;
+
+    db.prepare("UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?")
+      .run(JSON.stringify(data), new Date().toISOString(), token.updateRef.connectionId);
+  } finally {
+    db.close();
+  }
+}
+
 async function persistRefreshedToken(token, refreshed, options) {
   if (options.dryRun || !options.persistRefresh) return;
 
   if (token.updateRef.kind === "9router-db") {
+    if (token.updateRef.dbFormat === "sqlite" || token.sourceFormat === "sqlite" || isSqliteDbPath(token.sourcePath)) {
+      await persistRefreshed9RouterSqliteToken(token, refreshed);
+      return;
+    }
+
     await withFileLock(token.sourcePath, async () => {
       const db = await readJsonFile(token.sourcePath);
       const connections = Array.isArray(db?.providerConnections) ? db.providerConnections : [];
@@ -687,28 +1004,51 @@ async function getCodexUsage(token, options) {
   };
 }
 
-function isActivationCandidate(usage, options) {
-  if (!usage.ok) return false;
-  if (usage.primary.usedPercent > options.maxUsedPercent) return false;
-  if (!Number.isFinite(usage.primary.remainingMs) || usage.primary.remainingMs <= 0) return false;
-
+function isFreshWindow(remainingMs, windowMs, options) {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return false;
   return (
-    usage.primary.remainingMs >= SESSION_WINDOW_MS - options.startThresholdMs &&
-    usage.primary.remainingMs <= SESSION_WINDOW_MS + options.clockSkewMs
+    remainingMs >= windowMs - options.startThresholdMs &&
+    remainingMs <= windowMs + options.clockSkewMs
   );
 }
 
-async function activateCodexToken(token, options) {
-  if (shouldActivateThrough9Router(token, options)) {
-    return await activateCodexTokenThrough9Router(token, options);
-  }
-  return await activateCodexTokenDirect(token, options);
+function hasWeeklyCapacity(usage, options) {
+  if (!usage.ok) return false;
+  if (usage.secondary.usedPercent < 100) return true;
+  return isFreshWindow(usage.secondary.remainingMs, WEEK_WINDOW_MS, options);
 }
 
-function shouldActivateThrough9Router(token, options) {
-  if (options.activationMode === "direct") return false;
-  if (options.activationMode === "9router") return true;
-  return token.sourceType === "9router-db";
+function isActivationCandidate(usage, options) {
+  if (!usage.ok) return false;
+  if (!hasWeeklyCapacity(usage, options)) return false;
+  if (usage.primary.usedPercent > options.maxUsedPercent) return false;
+  return isFreshWindow(usage.primary.remainingMs, SESSION_WINDOW_MS, options);
+}
+
+function isWeeklyActivationCandidate(usage, options) {
+  if (!usage.ok) return false;
+  if (usage.secondary.usedPercent > options.maxUsedPercent) return false;
+  return isFreshWindow(usage.secondary.remainingMs, WEEK_WINDOW_MS, options);
+}
+
+async function activateCodexToken(token, options) {
+  if (options.activationMode === "9router") {
+    return await activateCodexTokenThrough9Router(token, options);
+  }
+
+  if (options.activationMode === "direct") {
+    return await activateCodexTokenDirect(token, options);
+  }
+
+  if (options.activationMode === "direct-proxy") {
+    return await activateCodexTokenDirect(token, options, token.activationProxy);
+  }
+
+  if (token.sourceType === "9router-db") {
+    return await activateCodexTokenDirect(token, options, token.activationProxy);
+  }
+
+  return await activateCodexTokenDirect(token, options);
 }
 
 function buildActivationBody(options, model) {
@@ -744,11 +1084,12 @@ function parseResetHint(status, text) {
   }
 }
 
-async function activateCodexTokenDirect(token, options) {
+async function activateCodexTokenDirect(token, options, proxyConfig = null) {
   const sessionId = `quota-primer-${tokenFingerprint(token.accessToken)}`;
   const body = buildActivationBody(options, options.model);
+  const effectiveProxy = proxyConfig && proxyConfig.source !== "none" ? proxyConfig : null;
 
-  const response = await fetchWithTimeout(CODEX_RESPONSES_URL, {
+  const response = await fetchWithOptionalProxy(CODEX_RESPONSES_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token.accessToken}`,
@@ -759,14 +1100,14 @@ async function activateCodexTokenDirect(token, options) {
       session_id: sessionId,
     },
     body: JSON.stringify(body),
-  }, options.timeoutMs);
+  }, options.timeoutMs, effectiveProxy);
 
   const text = response.ok
     ? await readResponseText(response, 65536, { drain: true })
     : await response.text().catch(() => "");
 
   return {
-    mode: "direct",
+    mode: effectiveProxy ? `direct-proxy:${proxyLabel(effectiveProxy)}` : "direct",
     status: response.status,
     ok: response.ok || response.status === 429,
     resetsAtMs: parseResetHint(response.status, text),
@@ -817,7 +1158,7 @@ async function resolve9RouterApiKey(options) {
   }
 
   try {
-    const db = await readJsonFile(options.dbPath);
+    const db = await read9RouterDb(options);
     const key = (Array.isArray(db?.apiKeys) ? db.apiKeys : [])
       .find((item) => item?.isActive !== false && typeof item.key === "string" && item.key.trim())?.key;
     options.resolvedRouterApiKey = key || "";
@@ -839,25 +1180,40 @@ async function saveState(state, options) {
   await atomicWriteJson(options.statePath, state);
 }
 
-function recentlyActivated(token, usage, state, options) {
+function activationStateKey(token, windowType) {
   const key = tokenFingerprint(token.accessToken);
+  return windowType === "weekly" ? `${key}:weekly` : key;
+}
+
+function activationResetAtMs(usage, activation, windowType) {
+  if (windowType === "weekly") return usage.secondary.resetAtMs || activation?.resetsAtMs || null;
+  return usage.primary.resetAtMs || activation?.resetsAtMs || null;
+}
+
+function recentlyActivated(token, usage, state, options, windowType = "session") {
+  const key = activationStateKey(token, windowType);
   const entry = state.activations[key];
   if (!entry) return false;
 
   const lastActivatedMs = parseTimeMs(entry.lastActivatedAt);
-  if (!lastActivatedMs || Date.now() - lastActivatedMs > options.activationCooldownMs) return false;
+  if (!lastActivatedMs) return false;
+  if (Date.now() - lastActivatedMs <= options.activationCooldownMs) return true;
 
-  const resetDelta = Math.abs(Number(entry.resetAtMs || 0) - Number(usage.primary.resetAtMs || 0));
+  const entryResetAtMs = parseTimeMs(entry.resetAtMs);
+  if (entryResetAtMs && entryResetAtMs - Date.now() > options.startThresholdMs) return true;
+
+  const resetDelta = Math.abs(Number(entryResetAtMs || 0) - Number(activationResetAtMs(usage, null, windowType) || 0));
   return resetDelta < 2 * 60 * 1000;
 }
 
-function markActivated(token, usage, activation, state) {
-  const key = tokenFingerprint(token.accessToken);
+function markActivated(token, usage, activation, state, windowType = "session") {
+  const key = activationStateKey(token, windowType);
   state.activations[key] = {
     sourceType: token.sourceType,
     sourceId: token.id,
+    windowType,
     lastActivatedAt: new Date().toISOString(),
-    resetAtMs: usage.primary.resetAtMs || activation.resetsAtMs || null,
+    resetAtMs: activationResetAtMs(usage, activation, windowType),
     status: activation.status,
   };
 
@@ -890,15 +1246,20 @@ async function checkToken(rawToken, options, state) {
   let token = rawToken;
 
   let dbAccess = await getCurrentDbAccess(token, options);
-  if (!dbAccess.allowed) {
+  const dbDisabled = dbAccess.disabled === true;
+  if (!dbAccess.allowed && !dbDisabled) {
     log(options, "info", `${label} skipped: ${dbAccess.reason}; no token refresh, usage check, or activation request sent`);
     return { checked: 1, candidate: 0, activated: 0, skipped: 1, failed: 0 };
   }
 
-  try {
-    token = await ensureFreshToken(token, options);
-  } catch (error) {
-    warn(`${label} refresh failed: ${error.message}`);
+  if (!dbDisabled) {
+    try {
+      token = await ensureFreshToken(token, options);
+    } catch (error) {
+      warn(`${label} refresh failed: ${error.message}`);
+    }
+  } else if (options.verbose) {
+    log(options, "info", `${label} disabled in 9Router DB: checking weekly reset only`);
   }
 
   let usage;
@@ -909,7 +1270,7 @@ async function checkToken(rawToken, options, state) {
     return { checked: 1, candidate: 0, activated: 0, skipped: 0, failed: 1 };
   }
 
-  if (!usage.ok && (usage.status === 401 || usage.status === 403) && options.refresh && token.refreshToken && !options.dryRun) {
+  if (!usage.ok && (usage.status === 401 || usage.status === 403) && !dbDisabled && options.refresh && token.refreshToken && !options.dryRun) {
     try {
       const refreshed = await refreshCodexAccessToken(token, options);
       await persistRefreshedToken(token, refreshed, options);
@@ -936,28 +1297,42 @@ async function checkToken(rawToken, options, state) {
   }
 
   const remaining = formatDuration(usage.primary.remainingMs);
-  const isCandidate = isActivationCandidate(usage, options);
+  const weeklyRemaining = formatDuration(usage.secondary.remainingMs);
+  const isSessionCandidate = !dbDisabled && isActivationCandidate(usage, options);
+  const isWeeklyCandidate = dbDisabled && isWeeklyActivationCandidate(usage, options);
+  const isCandidate = isSessionCandidate || isWeeklyCandidate;
 
   if (!isCandidate) {
     if (options.verbose) {
-      log(options, "info", `${label} session=${usage.primary.usedPercent}% reset=${remaining} weekly=${usage.secondary.usedPercent}%`);
+      const disabledHint = dbDisabled ? " disabled" : "";
+      log(options, "info", `${label}${disabledHint} session=${usage.primary.usedPercent}% reset=${remaining} weekly=${usage.secondary.usedPercent}% weeklyReset=${weeklyRemaining}`);
     }
-    return { checked: 1, candidate: 0, activated: 0, skipped: 0, failed: 0 };
+    return { checked: 1, candidate: 0, activated: 0, skipped: dbDisabled ? 1 : 0, failed: 0 };
   }
 
-  log(options, "candidate", `${label} candidate: session=${usage.primary.usedPercent}% reset=${remaining} source=${token.sourceType}`);
+  const windowType = isWeeklyCandidate ? "weekly" : "session";
+  const candidateReset = windowType === "weekly" ? weeklyRemaining : remaining;
+  const candidateUsed = windowType === "weekly" ? usage.secondary.usedPercent : usage.primary.usedPercent;
+  const disabledHint = dbDisabled ? " while disabled" : "";
+  const proxyHint = windowType === "session" ? ` proxy=${proxyLabel(token.activationProxy)}` : "";
+  log(options, "candidate", `${label} ${windowType} candidate${disabledHint}: ${windowType}=${candidateUsed}% reset=${candidateReset} weekly=${usage.secondary.usedPercent}% weeklyReset=${weeklyRemaining} source=${token.sourceType}${proxyHint}`);
 
   if (options.dryRun) {
     return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
   }
 
-  if (recentlyActivated(token, usage, state, options)) {
-    log(options, "candidate", `${label} skipped: activated recently for this reset window`);
+  if (recentlyActivated(token, usage, state, options, windowType)) {
+    log(options, "candidate", `${label} skipped: already activated for this ${windowType} reset window`);
     return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
   }
 
   dbAccess = await getCurrentDbAccess(token, options);
-  if (!dbAccess.allowed) {
+  if (windowType === "weekly" && !dbAccess.disabled) {
+    const reason = dbAccess.allowed ? "no longer disabled in 9Router DB" : dbAccess.reason;
+    log(options, "candidate", `${label} skipped before weekly activation: ${reason}`);
+    return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
+  }
+  if (windowType === "session" && !dbAccess.allowed) {
     log(options, "candidate", `${label} skipped before activation: ${dbAccess.reason}`);
     return { checked: 1, candidate: 1, activated: 0, skipped: 1, failed: 0 };
   }
@@ -967,13 +1342,14 @@ async function checkToken(rawToken, options, state) {
     if (!activation.ok) {
       throw new Error(`activation returned ${activation.status}${activation.bodyPreview ? `: ${activation.bodyPreview}` : ""}`);
     }
-    markActivated(token, usage, activation, state);
+    markActivated(token, usage, activation, state, windowType);
     const resetHint = activation.resetsAtMs ? ` reset=${formatDuration(activation.resetsAtMs - Date.now())}` : "";
     const modeHint = activation.mode ? ` via ${activation.mode}` : "";
-    log(options, "candidate", `${label} activated${modeHint}: upstream status ${activation.status}${resetHint}`);
+    const windowHint = windowType === "weekly" ? " weekly" : "";
+    log(options, "candidate", `${label} activated${windowHint}${modeHint}: upstream status ${activation.status}${resetHint}`);
     return { checked: 1, candidate: 1, activated: 1, skipped: 0, failed: 0 };
   } catch (error) {
-    warn(`${label} activation failed: ${error.message}`);
+    warn(`${label} activation failed: ${redactUrlSecrets(error.message)}`);
     return { checked: 1, candidate: 1, activated: 0, skipped: 0, failed: 1 };
   }
 }

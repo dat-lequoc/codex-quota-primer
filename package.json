@@ -15,11 +15,16 @@
     "restart": "node scripts/codex-quota-primerctl.mjs restart",
     "status": "node scripts/codex-quota-primerctl.mjs status",
     "logs": "node scripts/codex-quota-primerctl.mjs logs",
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:bash": "bash scripts/deploy.sh",
     "service:install": "node scripts/codex-quota-primer-service.mjs install",
     "service:uninstall": "node scripts/codex-quota-primer-service.mjs uninstall",
     "service:start": "node scripts/codex-quota-primer-service.mjs start",
     "service:stop": "node scripts/codex-quota-primer-service.mjs stop",
     "service:status": "node scripts/codex-quota-primer-service.mjs status",
     "service:logs": "node scripts/codex-quota-primer-service.mjs logs"
+  },
+  "dependencies": {
+    "undici": "^6.25.0"
   }
 }
